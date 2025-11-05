@@ -175,6 +175,15 @@
 
     <footer class="mt-10 text-sm text-gray-500">&copy; <span id="y"></span> Static Product Docs Manager</footer>
   </div>
+  
+  <!-- --- ADDED IMAGE MODAL HERE TO BE ABOVE THE SCRIPT --- -->
+  <div id="imageModal" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4 hidden">
+    <div class="relative bg-white p-4 rounded-xl shadow-xl max-w-4xl max-h-full overflow-auto">
+      <button id="closeModal" class="absolute -top-3 -right-3 w-8 h-8 bg-red-600 text-white rounded-full flex items-center justify-center shadow-lg text-2xl leading-none" aria-label="Close">&times;</button>
+      <img id="modalImage" src="" alt="Enlarged Product Image" class="max-w-full max-h-[80vh] object-contain">
+    </div>
+  </div>
+  <!-- --- END IMAGE MODAL --- -->
 
   <script>
     // =============================
@@ -200,14 +209,118 @@
         const writable = await handle.createWritable();
         await writable.write(blob);
         await writable.close();
-        showToast(`Saved ${suggestedName}`,'success');
+        showToast(`Saved ${suggestName}`,'success');
         return true;
       }catch(err){ return false; }
     }
 
-    const LS_KEY = 'product_docs_v1';
+    const LS_KEY = 'product_docs_v1'; // Old localStorage key
+    const DB_NAME = 'product_docs_v1_idb';
+    const STORE_NAME = 'products';
+    const MIGRATION_KEY = 'product_docs_migrated_v1';
+
     const $ = (sel) => document.querySelector(sel);
     const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+    // --- IndexedDB Wrapper ---
+    let dbPromise = null;
+    function initDB() {
+      if (dbPromise) return dbPromise;
+      dbPromise = new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, 1);
+        request.onerror = (e) => { console.error('IDB Error', e); reject('Error opening DB'); };
+        request.onsuccess = (e) => resolve(e.target.result);
+        request.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+          }
+        };
+      });
+      return dbPromise;
+    }
+
+    async function getAllProducts() {
+      const db = await initDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.getAll();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = (e) => { console.error(e); reject('Failed to get all products'); };
+      });
+    }
+
+    async function saveProduct(product) {
+      const db = await initDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.put(product);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = (e) => { console.error(e); reject('Failed to save product'); };
+      });
+    }
+
+    async function deleteProduct(id) {
+      const db = await initDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.delete(id);
+        request.onsuccess = () => resolve();
+        request.onerror = (e) => { console.error(e); reject('Failed to delete product'); };
+      });
+    }
+
+    async function clearAllProducts() {
+      const db = await initDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.clear();
+        request.onsuccess = () => resolve();
+        request.onerror = (e) => { console.error(e); reject('Failed to clear products'); };
+      });
+    }
+    
+    async function importProducts(products) {
+      const db = await initDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        let count = 0;
+        
+        // --- CHANGE: Removed store.clear() to merge data instead of replacing ---
+        // After clearing, add all new products
+        if (products.length === 0) {
+            resolve();
+            return;
+        }
+        products.forEach(p => {
+            // Use 'put' to upsert (update if ID exists, insert if not)
+            const putRequest = store.put(p);
+            putRequest.onsuccess = () => {
+                count++;
+                if (count === products.length) {
+                    resolve();
+                }
+            };
+            putRequest.onerror = (e) => {
+                console.warn('Failed to import/update product:', p.id, e);
+                // Continue trying to import others
+                count++;
+                if (count === products.length) {
+                    resolve();
+                }
+            };
+        });
+        // --- END CHANGE ---
+      });
+    }
+
+    // --- End IndexedDB Wrapper ---
+
 
     function readFileAsDataURL(file) {
       return new Promise((resolve, reject) => {
@@ -244,18 +357,16 @@
     }
 
     function humanLabel(p) { return (p.model || p.name || 'product').replace(/[\\/]/g, '-'); }
-    function loadAll() { try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch (e) { return []; } }
-    function normalizeAndSave(list){
-      let changed=false;
-      for (const p of list){
-        if (!p.id){ p.id = (window.crypto?.randomUUID?.() || String(Date.now()+Math.random())); changed=true; }
-        if (!('created_at' in p)) { p.created_at = Date.now(); changed=true; }
-        if (!('updated_at' in p)) { p.updated_at = p.created_at; changed=true; }
-      }
-      if (changed) saveAll(list);
-      return list;
+    
+    // This function is ONLY for the one-time migration
+    function _legacyLoadAllFromLocalStorage() { try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch { return []; } }
+    
+    function normalizeProduct(p){
+        if (!p.id){ p.id = (window.crypto?.randomUUID?.() || String(Date.now()+Math.random())); }
+        if (!('created_at' in p)) { p.created_at = Date.now(); }
+        if (!('updated_at' in p)) { p.updated_at = p.created_at; }
+        return p;
     }
-    function saveAll(list) { localStorage.setItem(LS_KEY, JSON.stringify(list)); }
 
     // Selection state
     const selectedIds = new Set();
@@ -309,7 +420,7 @@
             '<td class="p-3 w-10"><input type="checkbox" class="rowSel w-4 h-4" data-id="'+p.id+'" '+checked+'></td>'+
             '<td class="p-3">'+
               '<div class="flex items-center gap-2">'+
-                '<img src="'+(p.image?.dataUrl||'')+'" class="'+(p.image?.dataUrl?'':'hidden')+' w-8 h-8 object-cover rounded-md border" alt="thumb">'+
+                '<img src="'+(p.image?.dataUrl||'')+'" class="'+(p.image?.dataUrl?'cursor-pointer':'hidden')+' w-8 h-8 object-cover rounded-md border" alt="thumb" data-act="view-img" data-id="'+p.id+'">'+
                 '<div class="font-medium">'+escapeHtml(p.name||'')+'</div>'+ 
               '</div>'+ wattLumen + notesHtml +
             '</td>'+
@@ -343,7 +454,7 @@
     async function handleSave(e) {
       e.preventDefault();
       const name = $('#name').value.trim();
-      if (!name) { alert('Name is required'); return; }
+      if (!name) { showToast('Name is required', 'error'); return; }
       const model = $('#model').value.trim();
       const notes = $('#notes').value.trim();
       const type = $('#eqType')?.value || '';
@@ -354,36 +465,49 @@
       const photoFile = $('#photo') ? $('#photo').files[0] : null;
 
       const idEditing = $('#editId').value;
-      const list = normalizeAndSave(loadAll());
-      let p = idEditing ? list.find(x => x.id === idEditing) : null;
-      if (!p) { p = { id: crypto.randomUUID(), created_at: Date.now() }; list.push(p); }
+      let p = null;
+      if (idEditing) {
+        const allProducts = await getAllProducts();
+        p = allProducts.find(x => x.id === idEditing);
+      }
+      
+      if (!p) { 
+        p = { id: crypto.randomUUID(), created_at: Date.now() }; 
+      } else {
+        // Preserve existing files if new ones aren't uploaded
+        if (!csFile && p.cutsheet) { /* keep p.cutsheet */ }
+        if (!ctFile && p.cert) { /* keep p.cert */ }
+        if (!photoFile && p.image) { /* keep p.image */ }
+      }
+      
       p.name = name; p.model = model; p.notes = notes; p.type = type; p.watt = watt; p.lumen = lumen; p.updated_at = Date.now();
+      p = normalizeProduct(p); // Ensure timestamps/id exist
 
       if (csFile) {
-        if (csFile.type !== 'application/pdf') { alert('Cutsheet must be a PDF.'); return; }
+        if (csFile.type !== 'application/pdf') { showToast('Cutsheet must be a PDF.', 'error'); return; }
         const dataUrl = await readFileAsDataURL(csFile);
         p.cutsheet = { filename: csFile.name, mime: csFile.type, dataUrl };
       }
       if (ctFile) {
-        if (!['application/pdf','image/png','image/jpeg'].includes(ctFile.type)) { alert('Certification must be a PDF or PNG/JPG.'); return; }
+        if (!['application/pdf','image/png','image/jpeg'].includes(ctFile.type)) { showToast('Certification must be a PDF or PNG/JPG.', 'error'); return; }
         const dataUrl = await readFileAsDataURL(ctFile);
         p.cert = { filename: ctFile.name, mime: ctFile.type, dataUrl };
       }
       if (photoFile) {
-        if (!['image/png','image/jpeg'].includes(photoFile.type)) { alert('Product image must be PNG or JPG.'); return; }
+        if (!['image/png','image/jpeg'].includes(photoFile.type)) { showToast('Product image must be PNG or JPG.', 'error'); return; }
         const dataUrl = await readFileAsDataURL(photoFile);
         p.image = { filename: photoFile.name, mime: photoFile.type, dataUrl };
       }
 
-      saveAll(list);
-      render(list);
+      await saveProduct(p);
+      render(await getAllProducts());
       resetForm();
+      showToast(idEditing ? 'Product updated' : 'Product saved', 'success');
     }
 
-    function startEdit(id) {
-      const p = loadAll().find(x => x.id === id);
-      if (!p) return;
-      $('#editId').value = p.id;
+    async function startEdit(id) {
+      const allProducts = await getAllProducts();
+      const p = allProducts.find(x => x.id === id);
       $('#name').value = p.name || '';
       $('#model').value = p.model || '';
       $('#notes').value = p.notes || '';
@@ -396,15 +520,12 @@
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    function deleteItem(id) {
-      const before = loadAll();
-      const list = normalizeAndSave(before).filter(x => String(x.id) !== String(id));
-      const removed = before.length - list.length;
+    async function deleteItem(id) {
+      await deleteProduct(id);
       selectedIds.delete(String(id));
-      saveAll(list);
+      const list = await getAllProducts();
       render(list);
-      if (removed > 0) { showToast('Product deleted','success'); }
-      else { showToast('Nothing deleted (id not found)','error'); }
+      showToast('Product deleted','success');
     }
 
     async function triggerDownloadData(data, filename, mime='application/octet-stream') {
@@ -427,30 +548,30 @@
         const url = URL.createObjectURL(blob);
         a.href = url; a.download = filename;
         try { document.body.appendChild(a); a.click(); a.remove(); }
-        catch (e) { showToast('Click to download '+filename); document.body.appendChild(a); a.textContent = 'Click to download '+filename; a.className = 'fixed bottom-20 right-4 bg-blue-600 text-white px-3 py-2 rounded-xl'; }
+        catch { showToast('Click to download '+filename); document.body.appendChild(a); a.textContent = 'Click to download '+filename; a.className = 'fixed bottom-20 right-4 bg-blue-600 text-white px-3 py-2 rounded-xl'; }
         setTimeout(() => URL.revokeObjectURL(url), 3000);
         showToast(`Saved ${filename}`,'success');
       }catch(err){ console.error(err); showToast('Download failed: '+(err?.message||err),'error'); }
     }
 
     async function downloadCutsheet(id) {
-      const p = loadAll().find(x => x.id === id);
-      if (!p || !p.cutsheet) return alert('No cutsheet available');
+      const p = (await getAllProducts()).find(x => x.id === id);
+      if (!p || !p.cutsheet) { showToast('No cutsheet available', 'error'); return; }
       const label = humanLabel(p);
       if (p.cutsheet.dataUrl) await triggerDownloadData(p.cutsheet.dataUrl, `${label}-cutsheet.pdf`, 'application/pdf');
       else if (p.cutsheet.data64) await triggerDownloadData(legacyBase64ToArrayBuffer(p.cutsheet.data64), `${label}-cutsheet.pdf`, 'application/pdf');
-      else alert('Cutsheet data missing');
+      else showToast('Cutsheet data missing', 'error');
     }
 
     async function downloadCert(id) {
-      const p = loadAll().find(x => x.id === id);
-      if (!p || !p.cert) return alert('No certification available');
+      const p = (await getAllProducts()).find(x => x.id === id);
+      if (!p || !p.cert) { showToast('No certification available', 'error'); return; }
       const label = humanLabel(p);
       const mime = p.cert.mime || 'application/octet-stream';
       const ext = mime === 'application/pdf' ? '.pdf' : (mime==='image/png'?'.png':'.jpg');
       if (p.cert.dataUrl) await triggerDownloadData(p.cert.dataUrl, `${label}-cert${ext}`, mime);
       else if (p.cert.data64) await triggerDownloadData(legacyBase64ToArrayBuffer(p.cert.data64), `${label}-cert${ext}`, mime);
-      else alert('Certification data missing');
+      else showToast('Certification data missing', 'error');
     }
 
     async function combineProductDocs(p) {
@@ -494,8 +615,8 @@
     }
 
     async function downloadCombined(id) {
-      const p = loadAll().find(x => x.id === id);
-      if (!p || !p.cutsheet || !p.cert) return alert('Both cutsheet and certification are required');
+      const p = (await getAllProducts()).find(x => x.id === id);
+      if (!p || !p.cutsheet || !p.cert) { showToast('Both cutsheet and certification are required', 'error'); return; }
       const bytes = await combineProductDocs(p);
       const label = humanLabel(p);
       await triggerDownloadData(bytes, `${label}-combined.pdf`, 'application/pdf');
@@ -514,7 +635,7 @@
     }
 
     async function buildCutsheetsPDF(ids){
-      const list = loadAll();
+      const list = await getAllProducts();
       const chunks = [];
       for (const id of ids){
         const p = list.find(x=>x.id===id); if (!p || !p.cutsheet) continue;
@@ -529,7 +650,7 @@
     async function buildCertsPDF(ids){
       const { PDFDocument } = PDFLib;
       const out = await PDFDocument.create();
-      const list = loadAll();
+      const list = await getAllProducts();
       for (const id of ids){
         const p = list.find(x=>x.id===id); if (!p || !p.cert) continue;
         if (p.cert.mime === 'application/pdf'){
@@ -559,7 +680,7 @@
 
     async function buildCombinedPDF(ids){
       const chunks = [];
-      const list = loadAll();
+      const list = await getAllProducts();
       for (const id of ids){
         const p = list.find(x=>x.id===id); if (!p || !p.cutsheet || !p.cert) continue;
         const combined = await combineProductDocs(p);
@@ -574,13 +695,22 @@
     // =============================
     $('#productForm').addEventListener('submit', handleSave);
     $('#cancelEdit').addEventListener('click', (e) => { e.preventDefault(); resetForm(); });
-    $('#search').addEventListener('input', () => render(loadAll()));
-    $('#typeFilter').addEventListener('change', () => render(loadAll()));
-    $('#clearAllBtn').addEventListener('click', () => { if (confirm('Delete all products stored in this browser?')) { localStorage.removeItem(LS_KEY); selectedIds.clear(); render([]); }});
+    $('#search').addEventListener('input', async () => render(await getAllProducts()));
+    $('#typeFilter').addEventListener('change', async () => render(await getAllProducts()));
+    $('#clearAllBtn').addEventListener('click', async () => { 
+        // Removed confirm() as it blocks execution in an iframe.
+        // Be careful! This will delete all products immediately.
+        if (true) { // Was: if (confirm(...))
+            await clearAllProducts();
+            selectedIds.clear(); 
+            render([]); 
+            showToast('All products deleted', 'success');
+        }
+    });
 
-    $('#exportJsonBtn').addEventListener('click', () => {
+    $('#exportJsonBtn').addEventListener('click', async () => {
       try{
-        const json = JSON.stringify(loadAll(), null, 2);
+        const json = JSON.stringify(await getAllProducts(), null, 2);
         const blob = new Blob([json], { type: 'application/json' });
         const now = new Date(); const pad=n=>String(n).padStart(2,'0');
         const fname = `products-${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.json`;
@@ -591,8 +721,20 @@
     $('#importJson').addEventListener('change', async (e) => {
       const file = e.target.files[0]; if (!file) return;
       const text = await file.text();
-      try { const parsed = JSON.parse(text); if (Array.isArray(parsed)) { saveAll(parsed); render(parsed); } else { alert('Invalid JSON format'); } }
-      catch (err) { console.error(err); alert('Failed to parse JSON'); showToast('Import failed: '+(err?.message||err),'error'); }
+      try { 
+          const parsed = JSON.parse(text); 
+          if (Array.isArray(parsed)) { 
+            const normalized = parsed.map(normalizeProduct);
+            await importProducts(normalized); 
+            // --- CHANGE: Render all products and update toast message for merge ---
+            render(await getAllProducts()); 
+            showToast(`Imported/updated ${normalized.length} products.`, 'success');
+            // --- END CHANGE ---
+          } else { 
+            showToast('Invalid JSON format', 'error'); 
+          } 
+      }
+      catch (err) { console.error(err); showToast('Failed to parse JSON: '+(err?.message||err),'error'); }
       e.target.value = '';
     });
 
@@ -606,16 +748,30 @@
         updateBulkUI();
         return;
       }
+      // Handler for image modal
+      const img = e.target.closest('img[data-act="view-img"]');
+      if (img) {
+        e.preventDefault();
+        const id = img.getAttribute('data-id');
+        const p = (await getAllProducts()).find(x => x.id === id);
+        if (p && p.image?.dataUrl) {
+          $('#modalImage').src = p.image.dataUrl;
+          $('#imageModal').classList.remove('hidden');
+        }
+        return; // Stop further processing
+      }
       const btn = e.target.closest('button'); if (!btn) return;
       const id = btn.getAttribute('data-id');
       const act = btn.getAttribute('data-act');
       try {
         if (act === 'edit') startEdit(id);
-        else if (act === 'del') { if (confirm('Delete this product?')) deleteItem(id); }
+        else if (act === 'del') { 
+          deleteItem(id); // Removed confirm() as it blocks execution in an iframe
+        }
         else if (act === 'dl-cs') await downloadCutsheet(id);
         else if (act === 'dl-cert') await downloadCert(id);
         else if (act === 'dl-combined') await downloadCombined(id);
-      } catch (err) { console.error(err); alert('Operation failed: ' + (err?.message || err)); }
+      } catch (err) { console.error(err); showToast('Operation failed: ' + (err?.message || err), 'error'); }
     });
 
     // Master select
@@ -648,6 +804,7 @@
     async function runTests() {
       $('#testLog').textContent = '';
       logTest('Running tests...');
+      const testIds = ['T1', 'T2', 'T_DEL'];
       try {
         const { PDFDocument } = PDFLib;
         // Build tiny PDF for cutsheet
@@ -672,7 +829,6 @@
         const certPdfDataUrl = await (await fetch(certPdfUrl)).blob().then(b => new Promise(r=>{ const fr=new FileReader(); fr.onload=()=>r(fr.result); fr.readAsDataURL(b); }));
         URL.revokeObjectURL(certPdfUrl);
 
-        const list = loadAll();
         const p1 = { id: 'T1', name: 'Bulk One', model: 'B-1', type: 'Lighting', created_at: Date.now(), updated_at: Date.now(),
           cutsheet: { filename: 'cs1.pdf', mime: 'application/pdf', dataUrl: csDataUrl },
           cert: { filename: 'cert1.png', mime: 'image/png', dataUrl: certDataUrl },
@@ -683,7 +839,10 @@
           cert: { filename: 'cert2.pdf', mime: 'application/pdf', dataUrl: certPdfDataUrl },
           image: { filename: 'p2.png', mime: 'image/png', dataUrl: photoDataUrl },
           watt: '25', lumen: '2500' };
-        list.push(p1, p2); saveAll(list); render(list);
+        
+        await saveProduct(p1);
+        await saveProduct(p2);
+        render(await getAllProducts());
         logTest('✓ Seeded two products for bulk tests');
 
         // Combined for a single product
@@ -711,23 +870,33 @@
         else throw new Error('Bulk combined page count < 4');
 
         // Extra tests (added): watt/lumen render + filter by type
-        document.getElementById('typeFilter').value = 'Lighting'; render(normalizeAndSave(loadAll()));
+        document.getElementById('typeFilter').value = 'Lighting'; render(await getAllProducts());
         const firstName = document.querySelector('#rows tr td:nth-child(2) .font-medium')?.textContent?.trim();
         if (firstName === 'Bulk One') logTest('✓ Type filter applied (Lighting)');
         const wattText = document.querySelector('#rows tr td:nth-child(2) .text-xs')?.textContent?.includes('50 W');
         if (wattText) logTest('✓ Watt/Lumen rendered');
+        document.getElementById('typeFilter').value = ''; // reset filter
 
         // Delete test
-        const delList = loadAll();
-        delList.push({ id: 'T_DEL', name: 'Temp', created_at: Date.now(), updated_at: Date.now() });
-        saveAll(delList); render(delList);
-        deleteItem('T_DEL');
-        if (!loadAll().some(x=>x.id==='T_DEL')) logTest('✓ Delete removes item');
+        const pDel = { id: 'T_DEL', name: 'Temp', created_at: Date.now(), updated_at: Date.now() };
+        await saveProduct(pDel);
+        render(await getAllProducts());
+        await deleteItem('T_DEL');
+        if (!(await getAllProducts()).some(x=>x.id==='T_DEL')) logTest('✓ Delete removes item');
         else throw new Error('Delete failed');
 
         logTest('All tests passed.');
       } catch (err) {
         logTest('Test failure: ' + (err?.message || err));
+      } finally {
+        // Clean up test items
+        try {
+            for (const id of testIds) { await deleteProduct(id); }
+            logTest('✓ Test cleanup complete.');
+            render(await getAllProducts());
+        } catch (err) {
+            logTest('! Test cleanup failed: ' + err.message);
+        }
       }
     }
 
@@ -736,9 +905,67 @@
     // =============================
     // Init
     // =============================
-    document.getElementById('y').textContent = new Date().getFullYear();
-    document.getElementById('photo')?.addEventListener('change', async (e)=>{ const f=e.target.files[0]; const img=$('#photoPreview'); if (!f){ img?.classList.add('hidden'); return;} if(!['image/png','image/jpeg'].includes(f.type)){ showToast('Image must be PNG or JPG','error'); e.target.value=''; img?.classList.add('hidden'); return;} const dataUrl = await readFileAsDataURL(f); if (img){ img.src=dataUrl; img.classList.remove('hidden'); } });
-    render(normalizeAndSave(loadAll()));
+    async function mainInit() {
+        document.getElementById('y').textContent = new Date().getFullYear();
+        document.getElementById('photo')?.addEventListener('change', async (e)=>{ const f=e.target.files[0]; const img=$('#photoPreview'); if (!f){ img?.classList.add('hidden'); return;} if(!['image/png','image/jpeg'].includes(f.type)){ showToast('Image must be PNG or JPG','error'); e.target.value=''; img?.classList.add('hidden'); return;} const dataUrl = await readFileAsDataURL(f); if (img){ img.src=dataUrl; img.classList.remove('hidden'); } });
+
+        // Event listeners for the modal. Since the modal HTML is *above* the script now, 
+        // these should be found, but we keep the null checks for robustness.
+        const closeModalBtn = $('#closeModal');
+        if (closeModalBtn) {
+            closeModalBtn.addEventListener('click', () => {
+              $('#imageModal')?.classList.add('hidden');
+              $('#modalImage').src = ''; // Clear src
+            });
+        }
+        
+        const imageModalEl = $('#imageModal');
+        if (imageModalEl) {
+            imageModalEl.addEventListener('click', (e) => {
+                // Close if clicking the background overlay
+                if (e.target.id === 'imageModal') {
+                    imageModalEl.classList.add('hidden');
+                    $('#modalImage').src = ''; // Clear src
+                }
+            });
+        }
+
+        await initDB();
+        
+        // Check if migration is needed
+        if (!localStorage.getItem(MIGRATION_KEY)) {
+            const oldData = _legacyLoadAllFromLocalStorage();
+            if (oldData.length > 0) {
+                showToast(`Migrating ${oldData.length} products to new storage...`);
+                try {
+                    const normalized = oldData.map(normalizeProduct);
+                    await importProducts(normalized); // Clears and adds
+                    localStorage.removeItem(LS_KEY); // Remove old data
+                    localStorage.setItem(MIGRATION_KEY, 'true');
+                    showToast('Migration complete!', 'success');
+                } catch (err) {
+                    console.error('Migration failed:', err);
+                    showToast('Data migration failed. See console.', 'error');
+                }
+            } else {
+                // No old data, just mark as migrated
+                localStorage.setItem(MIGRATION_KEY, 'true');
+            }
+        }
+        
+        // Initial render from IDB
+        try {
+            const products = await getAllProducts();
+            render(products);
+        } catch (err) {
+            console.error('Failed to load initial products:', err);
+            showToast('Could not load products from database.', 'error');
+        }
+    }
+
+    // --- FIX: Ensure mainInit runs after the HTML structure is loaded ---
+    // The modal HTML is now placed before this script, but using DOMContentLoaded is the safest practice.
+    document.addEventListener('DOMContentLoaded', mainInit);
   </script>
 </body>
 </html>
